@@ -3,9 +3,9 @@
 short_tracks.py - поиск GPX-треков короче заданной длины.
 
 Длина считается по точкам <trkpt> внутри каждого .gpx (формула гаверсинуса).
-При переносе (-m) вместе с .gpx переносится парный <timestamp>.json,
-если он лежит в той же папке (timestamp берётся из конца имени GPX).
-Без аргументов выводится эта справка.
+При переносе (-m) или удалении (-d) вместе с .gpx обрабатывается парный
+<timestamp>.json, если он лежит в той же папке (timestamp берётся из конца
+имени GPX). Без аргументов выводится эта справка.
 """
 import argparse, glob, shutil, os, sys
 import xml.etree.ElementTree as ET
@@ -17,9 +17,12 @@ EPILOG = """\
   %(prog)s ~/tracks                     показать короткие треки в ~/tracks
   %(prog)s ~/tracks -l 0.5              порог 500 м вместо 1 км
   %(prog)s ~/tracks -m ~/tracks/short   перенести короткие треки (и их .json)
+  %(prog)s ~/tracks -l 0.1 -d           удалить треки короче 100 м (с вопросом)
+  %(prog)s ~/tracks -l 0.1 -d -y        то же, без подтверждения
 
 замечания:
-  без -m файлы только выводятся списком, ничего не перемещается;
+  без -m и -d файлы только выводятся списком, ничего не изменяется;
+  удаление необратимо (в корзину файлы не попадают);
   путь для -m берётся относительно текущей директории, а не папки с треками;
   повреждённые GPX выводятся как "ошибка" и пропускаются.
 """
@@ -37,14 +40,19 @@ def track_len(path):
     return sum(hav(pts[i], pts[i+1]) for i in range(len(pts)-1))
 
 ap = argparse.ArgumentParser(
-    description="Найти GPX-треки короче заданной длины и при желании перенести их.",
+    description="Найти GPX-треки короче заданной длины, перенести или удалить их.",
     epilog=EPILOG,
     formatter_class=argparse.RawDescriptionHelpFormatter,
 )
 ap.add_argument('folder', nargs='?', default='.',
                 help="папка с треками (. - текущая)")
-ap.add_argument('-m', '--move-to', metavar='DIR',
-                help="папка, куда переносить короткие треки")
+g = ap.add_mutually_exclusive_group()
+g.add_argument('-m', '--move-to', metavar='DIR',
+               help="папка, куда переносить короткие треки")
+g.add_argument('-d', '--delete', action='store_true',
+               help="удалить короткие треки (и парные .json)")
+ap.add_argument('-y', '--yes', action='store_true',
+                help="не спрашивать подтверждение при удалении")
 ap.add_argument('-l', '--limit', type=float, default=1.0, metavar='KM',
                 help="порог в км (по умолчанию 1)")
 
@@ -54,9 +62,7 @@ if len(sys.argv) == 1:
 
 args = ap.parse_args()
 
-if args.move_to:
-    os.makedirs(args.move_to, exist_ok=True)
-
+short = []
 for path in sorted(glob.glob(os.path.join(args.folder, '*.gpx'))):
     name = os.path.basename(path)
     try:
@@ -66,9 +72,33 @@ for path in sorted(glob.glob(os.path.join(args.folder, '*.gpx'))):
         continue
     if d < args.limit:
         print(f"{name}: {d*1000:.0f} м")
-        if args.move_to:
-            shutil.move(path, os.path.join(args.move_to, name))
-            ts = name.rsplit('_', 1)[-1].replace('.gpx', '')
-            js = os.path.join(args.folder, ts + '.json')
-            if os.path.exists(js):
-                shutil.move(js, os.path.join(args.move_to, ts + '.json'))
+        short.append(path)
+
+def pair_json(path):
+    ts = os.path.basename(path).rsplit('_', 1)[-1].replace('.gpx', '')
+    js = os.path.join(args.folder, ts + '.json')
+    return js if os.path.exists(js) else None
+
+if not short or not (args.move_to or args.delete):
+    print(f"\nнайдено: {len(short)}")
+    sys.exit(0)
+
+if args.delete:
+    print(f"\nбудет удалено треков: {len(short)} (вместе с парными .json)")
+    if not args.yes and input("Удалить? [y/N] ").strip().lower() != 'y':
+        print("отменено")
+        sys.exit(0)
+    for path in short:
+        os.remove(path)
+        js = pair_json(path)
+        if js:
+            os.remove(js)
+    print("удалено")
+else:
+    os.makedirs(args.move_to, exist_ok=True)
+    for path in short:
+        js = pair_json(path)
+        shutil.move(path, os.path.join(args.move_to, os.path.basename(path)))
+        if js:
+            shutil.move(js, os.path.join(args.move_to, os.path.basename(js)))
+    print("перенесено")
