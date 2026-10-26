@@ -178,21 +178,29 @@ def list_workouts(token):
 
 
 def parse_points(detail, start_ts):
-    """longitude_latitude: 'dlon,dlat;...' — первая точка абсолютная,
-    дальше приращения, единицы 1e-8 градуса.
-    Если координаты «уехали» — смотрите --debug и правьте SCALE."""
+    """Расшифровка трека (формат проверен на реальных данных T-Rex 2):
+    longitude_latitude: 'a,b;...' — ПЕРВОЕ значение это ШИРОТА, второе ДОЛГОТА
+      (вопреки названию поля), первая точка абсолютная, далее приращения,
+      единицы 1e-8 градуса.
+    altitude: сантиметры, по одному значению на точку.
+    time: интервалы в секундах между точками (первое — от начала trackid)."""
     SCALE = 1e8
     raw = detail.get("longitude_latitude") or ""
-    alts = [a for a in (detail.get("altitude") or "").split(";") if a]
-    pts, lon, lat = [], 0, 0
+    alts = [x for x in (detail.get("altitude") or "").split(";") if x]
+    deltas = [x for x in (detail.get("time") or "").split(";") if x]
+    pts, lat, lon, t = [], 0, 0, start_ts
     for i, chunk in enumerate(c for c in raw.split(";") if c):
         try:
-            dlon, dlat = (int(x) for x in chunk.split(",")[:2])
+            dlat, dlon = (int(x) for x in chunk.split(",")[:2])
         except ValueError:
             continue
-        lon += dlon
+        try:
+            t += int(deltas[i]) if i < len(deltas) else 1
+        except ValueError:
+            t += 1
         lat += dlat
-        if lon == 0 and lat == 0:
+        lon += dlon
+        if lat == 0 and lon == 0:
             continue
         ele = None
         if i < len(alts):
@@ -200,7 +208,7 @@ def parse_points(detail, start_ts):
                 ele = int(alts[i].split(",")[-1]) / 100.0  # см -> м
             except ValueError:
                 pass
-        pts.append((lat / SCALE, lon / SCALE, ele, start_ts + i))  # 1 точка ≈ 1 с
+        pts.append((lat / SCALE, lon / SCALE, ele, t))
     return pts
 
 
@@ -221,14 +229,42 @@ def write_gpx(path, name, pts):
     ET.ElementTree(gpx).write(path, encoding="utf-8", xml_declaration=True)
 
 
+def save_track(d, tid, out, overwrite=False):
+    start = int(tid)
+    stamp = datetime.fromtimestamp(start).strftime("%Y-%m-%d_%H%M%S")
+    gpx_path = out / f"{stamp}_{tid}.gpx"
+    if gpx_path.exists() and not overwrite:
+        return
+    pts = parse_points(d, start)
+    if not pts:
+        print(f"  {stamp}: нет GPS (тренировка в помещении?), пропуск")
+        return
+    write_gpx(gpx_path, f"Workout {stamp}", pts)
+    print(f"  {gpx_path.name}: {len(pts)} точек")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Zepp -> GPX")
     ap.add_argument("-o", "--out", default="tracks")
     ap.add_argument("--debug", action="store_true", help="сохранять сырой JSON")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="перезаписывать существующие GPX")
+    ap.add_argument("--from-json", nargs="+", metavar="FILE",
+                    help="не ходить в сеть: собрать GPX из локальных JSON "
+                         "(например tracks/*.json)")
     a = ap.parse_args()
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+
+    if a.from_json:
+        for f in sorted(a.from_json):
+            try:
+                d = json.loads(Path(f).read_text(encoding="utf-8"))
+                save_track(d, d["trackid"], out, overwrite=a.overwrite)
+            except (OSError, ValueError, KeyError) as e:
+                print(f"  {f}: пропуск ({e})")
+        return
 
     token = get_token()
     pick_host(token)
@@ -243,22 +279,12 @@ def main():
 
     for w in workouts:
         tid = w["trackid"]
-        start = int(tid)
-        stamp = datetime.fromtimestamp(start).strftime("%Y-%m-%d_%H%M%S")
-        gpx_path = out / f"{stamp}_{tid}.gpx"
-        if gpx_path.exists():
-            continue
         d = api_get(token, "/v1/sport/run/detail.json",
                     trackid=tid, source=w.get("source", SOURCE))
         if a.debug:
             (out / f"{tid}.json").write_text(
-                json.dumps(d, ensure_ascii=False, indent=1))
-        pts = parse_points(d, start)
-        if not pts:
-            print(f"  {stamp}: нет GPS (тренировка в помещении?), пропуск")
-            continue
-        write_gpx(gpx_path, f"Workout {stamp}", pts)
-        print(f"  {gpx_path.name}: {len(pts)} точек")
+                json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        save_track(d, tid, out, overwrite=a.overwrite)
 
 
 if __name__ == "__main__":
