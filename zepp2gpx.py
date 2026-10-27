@@ -12,6 +12,7 @@
 повторно и не ловить HTTP 429. Если токен протух, он сбрасывается автоматически.
 """
 import argparse
+import bisect
 import json
 import os
 import sys
@@ -212,19 +213,74 @@ def parse_points(detail, start_ts):
     return pts
 
 
+GPX_NS = "http://www.topografix.com/GPX/1/1"
+TPX_NS = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1"
+GAP_SPLIT = 30  # секунд: пропуск длиннее разрывает трек на сегменты (пауза)
+
+
+def parse_hr(detail, start_ts):
+    """heart_rate: 'dt,значение;...' — dt в секундах (пусто = 1),
+    первое значение абсолютное, остальные приращения к предыдущему.
+    Если расшифровка даёт нереальный пульс — возвращает [] (лучше без пульса,
+    чем с мусором)."""
+    raw = detail.get("heart_rate") or ""
+    samples, t, hr, first = [], start_ts, 0, True
+    for chunk in raw.split(";"):
+        if not chunk:
+            continue
+        dt_s, _, val_s = chunk.partition(",")
+        try:
+            dt = int(dt_s) if dt_s else 1
+            v = int(val_s)
+        except ValueError:
+            continue
+        t += dt
+        hr = v if first else hr + v
+        first = False
+        samples.append((t, hr))
+    if not samples:
+        return []
+    good = [(t, h) for t, h in samples if 30 <= h <= 230]
+    if len(good) < 0.8 * len(samples):
+        print("  пульс: расшифровка даёт нереальные значения, пропускаю")
+        return []
+    return good
+
+
+def attach_hr(pts, hr, max_age=15):
+    """Каждой точке GPS ставит последнее измерение пульса не старше max_age с."""
+    times = [t for t, _ in hr]
+    out = []
+    for lat, lon, ele, ts in pts:
+        bpm = None
+        i = bisect.bisect_right(times, ts) - 1
+        if i >= 0 and ts - times[i] <= max_age:
+            bpm = hr[i][1]
+        out.append((lat, lon, ele, ts, bpm))
+    return out
+
+
 def write_gpx(path, name, pts):
-    ET.register_namespace("", "http://www.topografix.com/GPX/1/1")
-    ns = "{http://www.topografix.com/GPX/1/1}"
+    ET.register_namespace("", GPX_NS)
+    ET.register_namespace("gpxtpx", TPX_NS)
+    ns = "{" + GPX_NS + "}"
     gpx = ET.Element(ns + "gpx", version="1.1", creator="zepp2gpx")
     trk = ET.SubElement(gpx, ns + "trk")
     ET.SubElement(trk, ns + "name").text = name
-    seg = ET.SubElement(trk, ns + "trkseg")
-    for lat, lon, ele, ts in pts:
+    seg, prev = None, None
+    for lat, lon, ele, ts, bpm in pts:
+        if seg is None or (prev is not None and ts - prev > GAP_SPLIT):
+            seg = ET.SubElement(trk, ns + "trkseg")
+        prev = ts
         p = ET.SubElement(seg, ns + "trkpt", lat=f"{lat:.7f}", lon=f"{lon:.7f}")
         if ele is not None:
             ET.SubElement(p, ns + "ele").text = f"{ele:.1f}"
         ET.SubElement(p, ns + "time").text = datetime.fromtimestamp(
             ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if bpm is not None:
+            ext = ET.SubElement(p, ns + "extensions")
+            tpx = ET.SubElement(ext, "{%s}TrackPointExtension" % TPX_NS)
+            ET.SubElement(tpx, "{%s}hr" % TPX_NS).text = str(bpm)
     ET.indent(gpx)
     ET.ElementTree(gpx).write(path, encoding="utf-8", xml_declaration=True)
 
@@ -239,8 +295,11 @@ def save_track(d, tid, out, overwrite=False):
     if not pts:
         print(f"  {stamp}: нет GPS (тренировка в помещении?), пропуск")
         return
+    hr = parse_hr(d, start)
+    pts = attach_hr(pts, hr) if hr else [(*p, None) for p in pts]
     write_gpx(gpx_path, f"Workout {stamp}", pts)
-    print(f"  {gpx_path.name}: {len(pts)} точек")
+    n_hr = sum(1 for p in pts if p[4] is not None)
+    print(f"  {gpx_path.name}: {len(pts)} точек, с пульсом: {n_hr}")
 
 
 def main():
